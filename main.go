@@ -41,9 +41,10 @@ const (
 )
 
 var (
-	kubeconfig  string
-	extraConfig string
-	filename    string
+	kubeconfig         string
+	customIgnoreConfig string
+	filename           string
+	loadedIgnoreConfig interface{}
 )
 
 func main() {
@@ -62,7 +63,7 @@ func main() {
 
 	cmd.PersistentFlags().StringVarP(&kubeconfig, "kubeconfig", "k", "~/.kube/config", "Path to kubeconfig file.")
 	cmd.PersistentFlags().StringVarP(&filename, "filename", "f", "", "Filename, directory, or URL to files contains the configuration to diff.")
-	cmd.PersistentFlags().StringVarP(&extraConfig, "extra-config", "e", "", "Path to extra config file.")
+	cmd.PersistentFlags().StringVarP(&customIgnoreConfig, "custom-ignore-config", "e", "", "Path to custom ignore config file.")
 
 	if err := cmd.Execute(); err != nil {
 		klog.Fatal(err)
@@ -86,6 +87,11 @@ func mainCmd() {
 	client, err := dynamic.NewForConfig(clientConfig)
 	if err != nil {
 		klog.Fatal(err)
+	}
+
+	loadedIgnoreConfig, err = loadIgnoreConfig()
+	if err != nil {
+		klog.Errorf("failed to load custom ignore config: %s", err.Error())
 	}
 
 	var tmpBuf = &bytes.Buffer{}
@@ -214,7 +220,8 @@ func splitYamlList(buf *bytes.Buffer) []unstructured.Unstructured {
 
 func writeReplaced(uns unstructured.Unstructured, dir string) error {
 	filtered := removeIgnoreFields(&uns)
-	if e := writeFile(*filtered, dir); e != nil {
+	fin := customIgnore(filtered.Object, loadedIgnoreConfig)
+	if e := writeFile(uns, fin, dir); e != nil {
 		return e
 	}
 	return nil
@@ -227,7 +234,8 @@ func writeOrigin(uns unstructured.Unstructured, rm meta.RESTMapper, client dynam
 	}
 
 	filtered := removeIgnoreFields(orig)
-	if err := writeFile(*filtered, dir); err != nil {
+	fin := customIgnore(filtered.Object, loadedIgnoreConfig)
+	if err := writeFile(uns, fin, dir); err != nil {
 		return err
 	}
 	return nil
@@ -256,6 +264,7 @@ func getOrigin(uns unstructured.Unstructured, rm meta.RESTMapper, client dynamic
 	return orig, nil
 }
 
+// replaceによりどうしても差分が出ちゃうものを削除
 func removeIgnoreFields(orig *unstructured.Unstructured) *unstructured.Unstructured {
 	unstructured.RemoveNestedField(orig.Object, "metadata", "managedFields")
 	unstructured.RemoveNestedField(orig.Object, "metadata", "generation")
@@ -265,15 +274,14 @@ func removeIgnoreFields(orig *unstructured.Unstructured) *unstructured.Unstructu
 	if len(anot) == 0 {
 		unstructured.RemoveNestedField(orig.Object, "metadata", "annotations")
 	}
-	lbls, _, _ := unstructured.NestedMap(orig.Object, "metadata", "labels")
-	if len(lbls) == 0 {
-		unstructured.RemoveNestedField(orig.Object, "metadata", "labels")
+	if orig.GetKind() == "ServiceAccount" {
+		unstructured.RemoveNestedField(orig.Object, "secrets")
 	}
 	return orig
 }
 
-func writeFile(uns unstructured.Unstructured, dir string) error {
-	b, err := kyaml.Marshal(uns.Object)
+func writeFile(uns unstructured.Unstructured, data interface{}, dir string) error {
+	b, err := kyaml.Marshal(data)
 	if err != nil {
 		return err
 	}
@@ -328,4 +336,136 @@ func replaceHomedir(path string) string {
 		klog.Fatal(err)
 	}
 	return strings.ReplaceAll(path, "~", home)
+}
+
+func loadIgnoreConfig() (interface{}, error) {
+	var cfg interface{}
+	if customIgnoreConfig == "" {
+		klog.Infoln("no configure for custom ignore")
+		return nil, nil
+	}
+	buf, err := os.ReadFile(customIgnoreConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load custom ignore config file : %s", err.Error())
+	}
+	if e := yaml.Unmarshal(buf, &cfg); e != nil {
+		return nil, fmt.Errorf("failed to ummarshal custom config yaml : %s", e.Error())
+	}
+	return cfg, nil
+}
+
+func customIgnore(isrc, itgt interface{}) interface{} {
+	if itgt == nil {
+		return isrc
+	}
+	switch isrc.(type) {
+	case map[string]interface{}:
+		result := map[string]interface{}{}
+		src, sok := isrc.(map[string]interface{})
+		tgt, tok := itgt.(map[string]interface{})
+		if !(sok && tok) {
+			return isrc
+		}
+		for sk, s := range src {
+			remain := true
+			for tk, t := range tgt {
+				if sk == tk {
+					if empty(t) || t == nil {
+						remain = false
+						break
+					} else {
+						s = customIgnore(s, t)
+					}
+				}
+			}
+			if remain && !empty(s) {
+				result[sk] = s
+			}
+		}
+		return result
+	case []interface{}:
+		var result []interface{}
+		src, sok := isrc.([]interface{})
+		tgt, tok := itgt.([]interface{})
+		if !(sok && tok) {
+			return isrc
+		}
+		for _, s := range src {
+			remain := true
+			for _, t := range tgt {
+				mat, nest := match(s, t)
+				if mat {
+					remain = false
+					break
+				} else {
+					if nest {
+						s = customIgnore(s, t)
+					}
+				}
+			}
+			if remain == true {
+				result = append(result, s)
+			}
+		}
+		return result
+	default:
+		return isrc
+	}
+}
+
+func match(isrc, itgt interface{}) (bool, bool) {
+	switch tgt := itgt.(type) {
+	case map[string]interface{}:
+		if len(tgt) != 1 { // 複数要素のマッチは未対応
+			return false, true
+		}
+		var tkey string
+		var tval interface{}
+		for k, iv := range tgt {
+			tkey = k
+			switch t := iv.(type) {
+			case map[string]interface{}, []interface{}:
+				return false, true // 更にnestがある場合はmatchを評価しない
+			default:
+				tval = t
+			}
+		}
+		src, ok := isrc.(map[string]interface{})
+		if ok {
+			for k, v := range src {
+				switch v.(type) {
+				case map[string]interface{}, []interface{}:
+					continue
+				default:
+					if tkey == k && tval == v {
+						return true, false
+					}
+				}
+			}
+		}
+		return false, false
+	case []interface{}:
+		return false, false // 現状ここには来ないはず（arrayが直接nestになるケースがあれば来る）
+	default:
+		if isrc == itgt {
+			return true, false
+		}
+		return false, false
+	}
+}
+
+func empty(i interface{}) bool {
+	m, mok := i.(map[string]interface{})
+	if mok {
+		if len(m) == 0 {
+			return true
+		}
+	}
+	s, sok := i.([]interface{})
+	if sok {
+		if len(s) == 0 {
+			return true
+		}
+	}
+	return false
 }
