@@ -41,11 +41,17 @@ const (
 )
 
 var (
-	kubeconfig         string
-	customIgnoreConfig string
-	filename           string
-	loadedIgnoreConfig interface{}
+	kubeconfig        string
+	extraConfigPath   string
+	filename          string
+	loadedExtraConfig extraConfig
+	ignoreGVKs        []schema.GroupVersionKind
 )
+
+type extraConfig struct {
+	IgnoreResources []string    `yaml:"ignoreResources"`
+	FieldFilter     interface{} `yaml:"fieldFilter"`
+}
 
 func main() {
 	cmd := &cobra.Command{
@@ -63,8 +69,7 @@ func main() {
 
 	cmd.PersistentFlags().StringVarP(&kubeconfig, "kubeconfig", "k", "~/.kube/config", "Path to kubeconfig file.")
 	cmd.PersistentFlags().StringVarP(&filename, "filename", "f", "", "Filename, directory, or URL to files contains the configuration to diff.")
-	cmd.PersistentFlags().StringVarP(&customIgnoreConfig, "custom-ignore-config", "e", "", "Path to custom ignore config file.")
-
+	cmd.PersistentFlags().StringVarP(&extraConfigPath, "extra-config", "e", "", "Path to extra config file.")
 	if err := cmd.Execute(); err != nil {
 		klog.Fatal(err)
 	}
@@ -89,10 +94,17 @@ func mainCmd() {
 		klog.Fatal(err)
 	}
 
-	loadedIgnoreConfig, err = loadIgnoreConfig()
+	rm, err := restMapper(clientConfig)
 	if err != nil {
-		klog.Errorf("failed to load custom ignore config: %s", err.Error())
+		klog.Fatal(err)
 	}
+
+	loadedExtraConfig, err = loadExtraConfig()
+	if err != nil {
+		klog.Errorf("failed to load extra config: %s", err.Error())
+	}
+
+	ignoreGVKs = listIgnoreGVK(rm, loadedExtraConfig.IgnoreResources)
 
 	var tmpBuf = &bytes.Buffer{}
 
@@ -108,11 +120,10 @@ func mainCmd() {
 	ro, err := newReplaceOptions(ioStreams, client, fact)
 
 	if err := ro.Run(fact); err != nil {
-		klog.Fatal(err.Error())
+		klog.Errorf("errors occurred when replacing resources : %s", err.Error())
 	}
 
 	us := splitYamlList(tmpBuf)
-	rm, _ := restMapper(clientConfig)
 	for _, u := range us {
 		if e := writeReplaced(u, toDir); e != nil {
 			klog.Errorf("failed to write replaced yaml: %s", err.Error())
@@ -219,8 +230,11 @@ func splitYamlList(buf *bytes.Buffer) []unstructured.Unstructured {
 }
 
 func writeReplaced(uns unstructured.Unstructured, dir string) error {
+	if matchGroupKind(uns, ignoreGVKs) {
+		return nil
+	}
 	filtered := removeIgnoreFields(&uns)
-	fin := customIgnore(filtered.Object, loadedIgnoreConfig)
+	fin := customFieldFilter(filtered.Object, loadedExtraConfig.FieldFilter)
 	if e := writeFile(uns, fin, dir); e != nil {
 		return e
 	}
@@ -228,15 +242,18 @@ func writeReplaced(uns unstructured.Unstructured, dir string) error {
 }
 
 func writeOrigin(uns unstructured.Unstructured, rm meta.RESTMapper, client dynamic.Interface, dir string) error {
+	if matchGroupKind(uns, ignoreGVKs) {
+		return nil
+	}
 	orig, err := getOrigin(uns, rm, client)
 	if err != nil {
 		return err
 	}
 
 	filtered := removeIgnoreFields(orig)
-	fin := customIgnore(filtered.Object, loadedIgnoreConfig)
-	if err := writeFile(uns, fin, dir); err != nil {
-		return err
+	fin := customFieldFilter(filtered.Object, loadedExtraConfig.FieldFilter)
+	if e := writeFile(uns, fin, dir); e != nil {
+		return e
 	}
 	return nil
 }
@@ -338,23 +355,41 @@ func replaceHomedir(path string) string {
 	return strings.ReplaceAll(path, "~", home)
 }
 
-func loadIgnoreConfig() (interface{}, error) {
-	var cfg interface{}
-	if customIgnoreConfig == "" {
-		klog.Infoln("no configure for custom ignore")
-		return nil, nil
+func loadExtraConfig() (extraConfig, error) {
+	var cfg extraConfig
+	if extraConfigPath == "" {
+		klog.Infoln("no setting for extra config")
+		return cfg, nil
 	}
-	buf, err := os.ReadFile(customIgnoreConfig)
+	buf, err := os.ReadFile(extraConfigPath)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load custom ignore config file : %s", err.Error())
+		return cfg, fmt.Errorf("failed to load extra config file : %s", err.Error())
 	}
 	if e := yaml.Unmarshal(buf, &cfg); e != nil {
-		return nil, fmt.Errorf("failed to ummarshal custom config yaml : %s", e.Error())
+		return cfg, fmt.Errorf("failed to ummarshal extra config yaml : %s", e.Error())
+	}
+	cfg, e := parseFieldFilter(cfg)
+	if e != nil {
+		return cfg, fmt.Errorf("failed to parse field filter : %s", e.Error())
 	}
 	return cfg, nil
 }
 
-func customIgnore(isrc, itgt interface{}) interface{} {
+func parseFieldFilter(cfg extraConfig) (extraConfig, error) {
+	switch icfg := cfg.FieldFilter.(type) {
+	case string:
+		var y interface{}
+		if e := yaml.Unmarshal([]byte(icfg), &y); e != nil {
+			return cfg, fmt.Errorf("failed to unmarshal fieldFilter : ,%s", e.Error())
+		}
+		cfg.FieldFilter = y
+	default:
+		//
+	}
+	return cfg, nil
+}
+
+func customFieldFilter(isrc, itgt interface{}) interface{} {
 	if itgt == nil {
 		return isrc
 	}
@@ -374,7 +409,7 @@ func customIgnore(isrc, itgt interface{}) interface{} {
 						remain = false
 						break
 					} else {
-						s = customIgnore(s, t)
+						s = customFieldFilter(s, t)
 					}
 				}
 			}
@@ -399,7 +434,7 @@ func customIgnore(isrc, itgt interface{}) interface{} {
 					break
 				} else {
 					if nest {
-						s = customIgnore(s, t)
+						s = customFieldFilter(s, t)
 					}
 				}
 			}
@@ -464,6 +499,37 @@ func empty(i interface{}) bool {
 	s, sok := i.([]interface{})
 	if sok {
 		if len(s) == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func listIgnoreGVK(rm meta.RESTMapper, resources []string) []schema.GroupVersionKind {
+	var result []schema.GroupVersionKind
+	for _, r := range resources {
+		if gvk, err := rm.KindFor(schema.GroupVersionResource{
+			Group:    "",
+			Version:  "",
+			Resource: r,
+		}); err != nil {
+			klog.Errorf("failed to get GVK from resource : %s", err.Error())
+		} else {
+			result = append(result, gvk)
+		}
+	}
+	return result
+}
+
+func matchGroupKind(uns unstructured.Unstructured, gvks []schema.GroupVersionKind) bool {
+	for _, gvk := range gvks {
+		gv := strings.Split(uns.GetAPIVersion(), "/")
+		if len(gv) == 1 {
+			gv = append([]string{""}, gv...)
+		}
+		g := gv[0]
+
+		if g == gvk.Group && uns.GetKind() == gvk.Kind {
 			return true
 		}
 	}
