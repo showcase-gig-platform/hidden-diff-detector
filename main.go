@@ -147,11 +147,9 @@ func loadKubeClientConfig() (*rest.Config, error) {
 	var err error
 	kubeconfigPath := filepath.Join(homedir.HomeDir(), ".kube", "config")
 	if useInclusterConfig {
-		clientConfig, err = rest.InClusterConfig()
-		if err != nil {
-			return clientConfig, fmt.Errorf("failed to load in cluster config: %s", err.Error())
-		}
+		return rest.InClusterConfig()
 	}
+
 	configFromEnv := os.Getenv("KUBECONFIG")
 	if len(kubeconfig) != 0 {
 		kubeconfigPath = kubeconfig
