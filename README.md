@@ -24,10 +24,12 @@ $ cat manifest.yaml | hidden-diff-detector -f -
 ### flags
 
 ```
+-c, --context string        Kubeconfig context name to use.
 -e, --extra-config string   Path to extra config file.
 -f, --filename string       Filename, directory, or URL to files contains the configuration to diff.
 -h, --help                  help for use
--k, --kubeconfig string     Path to kubeconfig file. (default "~/.kube/config")
+-i, --in-cluster            Set true if used in kubernetes cluster.
+-k, --kubeconfig string     Path to kubeconfig file.
 ```
 
 ## Extra configuration

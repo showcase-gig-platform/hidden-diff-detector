@@ -22,6 +22,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/client-go/util/homedir"
 	"k8s.io/klog/v2"
 	"k8s.io/kubectl/pkg/cmd/replace"
 	cmdutil "k8s.io/kubectl/pkg/cmd/util"
@@ -41,11 +42,13 @@ const (
 )
 
 var (
-	kubeconfig        string
-	extraConfigPath   string
-	filename          string
-	loadedExtraConfig extraConfig
-	ignoreGVKs        []schema.GroupVersionKind
+	kubeconfig         string
+	extraConfigPath    string
+	filename           string
+	kubeContext        string
+	useInclusterConfig bool
+	loadedExtraConfig  extraConfig
+	ignoreGVKs         []schema.GroupVersionKind
 )
 
 type extraConfig struct {
@@ -67,9 +70,11 @@ func main() {
 	klog.InitFlags(nil)
 	pflag.CommandLine.AddGoFlagSet(flag.CommandLine)
 
-	cmd.PersistentFlags().StringVarP(&kubeconfig, "kubeconfig", "k", "~/.kube/config", "Path to kubeconfig file.")
+	cmd.PersistentFlags().StringVarP(&kubeconfig, "kubeconfig", "k", "", "Path to kubeconfig file.")
 	cmd.PersistentFlags().StringVarP(&filename, "filename", "f", "", "Filename, directory, or URL to files contains the configuration to diff.")
 	cmd.PersistentFlags().StringVarP(&extraConfigPath, "extra-config", "e", "", "Path to extra config file.")
+	cmd.PersistentFlags().StringVarP(&kubeContext, "context", "c", "", "Kubeconfig context name to use.")
+	cmd.PersistentFlags().BoolVarP(&useInclusterConfig, "in-cluster", "i", false, "Set true if used in kubernetes cluster.")
 	if err := cmd.Execute(); err != nil {
 		klog.Fatal(err)
 	}
@@ -82,9 +87,8 @@ func mainCmd() {
 	if filename == "" {
 		klog.Fatal("flag `--filename` or `-f` is required.")
 	}
-	kubeconfig = replaceHomedir(kubeconfig)
 
-	clientConfig, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	clientConfig, err := loadKubeClientConfig()
 	if err != nil {
 		klog.Fatal(err)
 	}
@@ -136,6 +140,37 @@ func mainCmd() {
 	if err := diff(fromDir, toDir); err != nil {
 		klog.Fatal(err)
 	}
+}
+
+func loadKubeClientConfig() (*rest.Config, error) {
+	var clientConfig *rest.Config
+	var err error
+	kubeconfigPath := filepath.Join(homedir.HomeDir(), ".kube", "config")
+	if useInclusterConfig {
+		clientConfig, err = rest.InClusterConfig()
+		if err != nil {
+			return clientConfig, fmt.Errorf("failed to load in cluster config: %s", err.Error())
+		}
+	}
+	configFromEnv := os.Getenv("KUBECONFIG")
+	if len(kubeconfig) != 0 {
+		kubeconfigPath = kubeconfig
+	} else if len(configFromEnv) != 0 {
+		kubeconfigPath = configFromEnv
+	}
+
+	cor := &clientcmd.ConfigOverrides{}
+	if len(kubeContext) != 0 {
+		cor.CurrentContext = kubeContext
+	}
+	clientConfig, err = clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		&clientcmd.ClientConfigLoadingRules{
+			ExplicitPath: kubeconfigPath,
+		},
+		cor,
+	).ClientConfig()
+
+	return clientConfig, err
 }
 
 // replaceOption各フィールドの詳細も把握していない（動けばヨシ状態）し、全体的に雑
@@ -345,14 +380,6 @@ func cleanup() {
 	if err := os.RemoveAll(tmpDir); err != nil {
 		klog.Errorf("failed to remove tmp directory: %s", err)
 	}
-}
-
-func replaceHomedir(path string) string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		klog.Fatal(err)
-	}
-	return strings.ReplaceAll(path, "~", home)
 }
 
 func loadExtraConfig() (extraConfig, error) {
