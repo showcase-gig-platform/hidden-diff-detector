@@ -58,10 +58,10 @@ type extraConfig struct {
 
 func main() {
 	cmd := &cobra.Command{
-		Use:     "use",
-		Short:   "short",
-		Long:    "long",
-		Example: "example",
+		Short: "hidden-diff-detector detects diff not detected by kubectl diff.",
+		Use:   "hidden-diff-detector",
+		Example: `  hidden-diff-detector -f mymanifest.yaml
+  kustomize build /my/kustomization/path | hidden-diff-detector -f -`,
 		Run: func(cmd *cobra.Command, args []string) {
 			mainCmd()
 		},
