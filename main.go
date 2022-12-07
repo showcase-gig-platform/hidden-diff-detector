@@ -383,7 +383,7 @@ func cleanup() {
 func loadExtraConfig() (extraConfig, error) {
 	var cfg extraConfig
 	if extraConfigPath == "" {
-		klog.Infoln("no setting for extra config")
+		klog.V(5).Infoln("no setting for extra config")
 		return cfg, nil
 	}
 	buf, err := os.ReadFile(extraConfigPath)
